@@ -8,9 +8,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import (
+    ActionPayload,
+    ActionResult,
+    EntryPayload,
+    IdentityBackfillPayload,
+    PageResult,
+)
 from app.services import service_for
-from app.services.data_flow import FlowEffect, FLOW_TRIGGERS, flow_engine
+from app.services.data_flow import FlowEffect, FLOW_TRIGGERS, backfill_rule_identities, flow_engine
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -102,9 +108,19 @@ def get_flow_trace(module: str, entry_id: int):
             for fn in triggers:
                 eff = fn(entry_id)
                 effects.extend([{"name": e.name, "module": e.module, "entry_id": e.entry_id,
-                                 "description": e.description, "timestamp": e.timestamp}
+                                 "description": e.description, "timestamp": e.timestamp,
+                                 "ref_no": e.ref_no}
                                 for e in eff])
     return {"module": module, "entry_id": entry_id, "effects": effects}
+
+
+@router.post("/derive_rule/{entry_id}/identity-backfill", response_model=ActionResult)
+def backfill_derive_identities(entry_id: int, payload: IdentityBackfillPayload) -> ActionResult:
+    """补齐历史衍生规则的输入特征身份，并重新核对来源决定能否启效。"""
+    entry, message = backfill_rule_identities(entry_id, payload.identifiers)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=message)
+    return ActionResult(ok=True, message=message, entry=entry)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)

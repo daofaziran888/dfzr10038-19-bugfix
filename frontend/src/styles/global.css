@@ -70,3 +70,11 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .analysis-chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; padding: 12px 0; }
 .analysis-bar { flex: 1; border-radius: 4px 4px 0 0; background: var(--brand); min-width: 24px; position: relative; transition: height 0.4s; }
 .analysis-bar span { position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%); font-size: 10px; color: var(--muted); white-space: nowrap; }
+/* 链路回执：注册回执与衍生详情共享同一规则编号 */
+.flow-receipt { margin-top: 12px; padding: 12px 16px; background: #fff; border: 1px solid var(--border); border-radius: 8px; }
+.flow-receipt h4 { margin: 0 0 8px; font-size: 13px; color: var(--brand); }
+.flow-receipt ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.flow-receipt li { font-size: 12px; color: #334155; display: flex; flex-wrap: wrap; gap: 8px; }
+.flow-receipt .effect-name { font-weight: 600; color: #0f172a; }
+.flow-receipt .effect-ref { background: #eef2ff; color: var(--brand); border-radius: 4px; padding: 0 6px; }
+.flow-receipt .effect-desc { color: var(--muted); flex-basis: 100%; }

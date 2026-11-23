@@ -90,6 +90,17 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <div v-if="flowReceipt" class="flow-receipt" data-testid="flow-receipt">
+      <h4>链路回执 · {{ flowReceipt.chains.join(' / ') }}</h4>
+      <ul>
+        <li v-for="(effect, index) in flowReceipt.effects" :key="index" :data-ref-no="effect.ref_no ?? ''">
+          <span class="effect-name">{{ effect.name }}</span>
+          <span v-if="effect.ref_no" class="effect-ref">编号：{{ effect.ref_no }}</span>
+          <span class="effect-desc">{{ effect.description }}</span>
+        </li>
+      </ul>
+    </div>
   </section>
 </template>
 
@@ -103,13 +114,14 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { EntryRow, FlowReceipt } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const flowReceipt = ref<FlowReceipt | null>(null)
 const filters = ref<Record<string, string>>({})
 const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
@@ -170,6 +182,7 @@ async function runAction(action: string, row: EntryRow) {
   try {
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
+    flowReceipt.value = result.flow ?? null
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'

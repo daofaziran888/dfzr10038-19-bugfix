@@ -12,6 +12,16 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from app.store import store
+from app.services.derive_rule import (
+    IDENTITY_FIELD,
+    PENDING_FIELD,
+    VERIFY_FIELD,
+    WINDOW_FIELD,
+    feature_id_index,
+    feature_name_index,
+    rule_input_token_set,
+    split_tokens,
+)
 
 # ---------------------------------------------------------------------------
 # 链路副作用记录
@@ -26,6 +36,8 @@ class FlowEffect:
     entry_id: int
     description: str
     timestamp: str = field(default_factory=lambda: datetime.datetime.now().isoformat())
+    # 关联业务编号（如衍生规则编号、窗口模板编号），保证回执与下游清单引用同一身份
+    ref_no: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -56,42 +68,227 @@ def flow_reg_to_derive_to_window(feature_reg_id: int) -> list[FlowEffect]:
     if feature_reg_entry is None or feature_reg_entry.get("status") != "已注册":
         return effects
 
-    feat_no = str(feature_reg_entry.get("特征编号", ""))
-    feat_name = str(feature_reg_entry.get("特征名称", ""))
+    feat_no = str(feature_reg_entry.get("特征编号", "")).strip()
+    feat_name = str(feature_reg_entry.get("特征名称", "")).strip()
 
-    # 查找关联的衍生规则并启效
-    derive_rows = store.rows("derive_rule")
-    for row in derive_rows:
-        if str(row.get("输入特征", "")) and feat_name in str(row.get("输入特征", "")):
-            if row.get("status") == "草稿":
-                row["status"] = "生效中"
-                row["pending"] = True
-                row["abnormal"] = False
-                effects.append(FlowEffect(
-                    "启效规则", "derive_rule", int(row.get("id", 0)),
-                    f"特征 {feat_no} 注册后联动启效衍生规则 {row.get('规则编号','')}",
-                ))
-                # 同时联动时间窗口
-                _window_compute_for_derived(row, feat_no, effects)
+    # 只处理草稿规则：已生效/异常/停用规则不重复启效，前缀重叠绝不视为依赖命中
+    for row in store.rows("derive_rule"):
+        if row.get("status") != "草稿":
+            continue
+        if feat_no not in rule_input_token_set(row) and feat_name not in rule_input_token_set(row):
+            continue
+
+        rule_no = str(row.get("规则编号", ""))
+        verification = _verify_rule_inputs(row, triggered_feat_no=feat_no, triggered_feat_name=feat_name)
+        if not verification["ready"]:
+            # 来源无法核对（重名未定责/输入尚未注册）：维持草稿，登记核实待办，规则仍可被检索
+            row[PENDING_FIELD] = verification["pending_tokens"]
+            row[VERIFY_FIELD] = "待核实"
+            _ensure_identity_followup(rule_no, verification["reasons"], effects)
+            effects.append(FlowEffect(
+                "待核实挂起", "derive_rule", int(row.get("id", 0)),
+                f"特征 {feat_no} 审核后规则 {rule_no} 输入身份未核实，维持草稿等待输入核实："
+                f"{'；'.join(verification['reasons'])}",
+                ref_no=rule_no,
+            ))
+            continue
+
+        # 先在衍生工程写入规则启效数据（登记实际输入身份），再把实际输出交给时间窗口
+        row["status"] = "生效中"
+        row["pending"] = True
+        row["abnormal"] = False
+        row[IDENTITY_FIELD] = verification["identifiers"]
+        row[PENDING_FIELD] = []
+        row[VERIFY_FIELD] = "已核实"
+        effects.append(FlowEffect(
+            "启效规则", "derive_rule", int(row.get("id", 0)),
+            f"特征 {feat_no} 注册后联动启效衍生规则 {rule_no}，输入身份={'、'.join(verification['identifiers'])}",
+            ref_no=rule_no,
+        ))
+        _window_compute_for_derived(row, feat_no, effects)
+        _close_identity_followup(rule_no)
 
     return effects
+
+
+def _verify_rule_inputs(
+    rule_row: dict[str, Any], *, triggered_feat_no: str, triggered_feat_name: str
+) -> dict[str, Any]:
+    """核对规则全部输入的来源身份，整套输入都可核对才允许启效。
+
+    - 已登记特征编号：按编号在注册库精确核对（草稿也算身份存在，编号唯一）；
+    - 只有显示名的历史词条：按已注册特征名解析，同名跨业务域命中多条即歧义；
+    - 多输入规则要求每个输入都定责，任一未核实则整套规则等待。
+    """
+    id_index = feature_id_index()
+    name_index = feature_name_index()
+    tokens = split_tokens(rule_row.get("输入特征", ""))
+    explicit = [str(ident).strip() for ident in rule_row.get(IDENTITY_FIELD, []) if str(ident).strip()]
+
+    identifiers: list[str] = []
+    pending_tokens: list[str] = []
+    reasons: list[str] = []
+
+    for ident in explicit:
+        target = id_index.get(ident)
+        if target is None:
+            pending_tokens.append(ident)
+            reasons.append(f"输入身份 {ident} 在特征注册库中不存在，来源无法核对")
+        elif target.get("status") != "已注册":
+            pending_tokens.append(ident)
+            reasons.append(f"输入身份 {ident} 尚未审核注册，等待输入核实")
+        else:
+            identifiers.append(ident)
+
+    for token in tokens:
+        # 该词条已被显式编号覆盖（编号对应特征名相同），无需再按名称解析
+        if any(str(id_index.get(ident, {}).get("特征名称", "")).strip() == token
+               for ident in identifiers):
+            continue
+        matches = name_index.get(token, [])
+        if len(matches) == 1:
+            only = matches[0]
+            if only.get("status") == "已注册":
+                identifiers.append(str(only.get("特征编号", "")).strip())
+            else:
+                pending_tokens.append(token)
+                reasons.append(f"输入 {token} 尚未审核注册，等待输入核实")
+        elif len(matches) > 1:
+            domains = sorted({str(m.get("业务域", "")).strip() or "未标注业务域" for m in matches})
+            pending_tokens.append(token)
+            reasons.append(f"显示名 {token} 在业务域【{'、'.join(domains)}】重名，需补齐特征编号定责")
+        else:
+            pending_tokens.append(token)
+            reasons.append(f"输入 {token} 尚未注册或未审核通过，等待输入核实")
+
+    # 去重但保留登记顺序
+    seen: set[str] = set()
+    identifiers = [ident for ident in identifiers if not (ident in seen or seen.add(ident))]
+
+    # 触发本次联动的特征本身必须在可核对身份集合内，杜绝跨身份串号
+    triggered_ok = triggered_feat_no in identifiers or triggered_feat_name in tokens
+    ready = triggered_ok and not pending_tokens and bool(tokens or explicit)
+    return {
+        "ready": ready,
+        "identifiers": identifiers,
+        "pending_tokens": pending_tokens,
+        "reasons": reasons,
+    }
+
+
+def _ensure_identity_followup(rule_no: str, reasons: list[str], effects: list[FlowEffect]) -> None:
+    """为身份未核实的规则登记治理待办（同一规则只保留一条未闭环待办）。"""
+    for arow in store.rows("govern_audit"):
+        if arow.get("source_rule") == rule_no and arow.get("整改状态") not in ("已闭环",):
+            arow["问题项"] = "；".join(reasons)
+            return
+    rows = store.rows("govern_audit")
+    next_id = max((int(row.get("id", 0)) for row in rows), default=0) + 1
+    rows.append({
+        "id": next_id,
+        "status": "整改中",
+        "pending": True,
+        "abnormal": True,
+        "记录编号": f"GOVE-IDV-{next_id:04d}",
+        "审计对象": f"衍生规则/{rule_no}",
+        "审计类型": "输入身份核实",
+        "检查结果": "待核实",
+        "问题项": "；".join(reasons),
+        "整改方案": "补齐输入特征编号（特征身份）后重新核对来源",
+        "审计时间": datetime.datetime.now().isoformat(),
+        "整改状态": "待补齐身份",
+        "source_rule": rule_no,
+    })
+    effects.append(FlowEffect(
+        "登记核实待办", "govern_audit", next_id,
+        f"规则 {rule_no} 输入身份未核实，登记治理待办 GOVE-IDV-{next_id:04d}",
+        ref_no=rule_no,
+    ))
+
+
+def _close_identity_followup(rule_no: str) -> None:
+    """规则成功启效后闭环其身份核实待办。"""
+    for arow in store.rows("govern_audit"):
+        if arow.get("source_rule") == rule_no and arow.get("整改状态") != "已闭环":
+            arow["status"] = "已通过"
+            arow["pending"] = False
+            arow["abnormal"] = False
+            arow["检查结果"] = "通过"
+            arow["整改状态"] = "已闭环"
+            arow["审计时间"] = datetime.datetime.now().isoformat()
+
+
+def backfill_rule_identities(rule_id: int, identifiers: list[str]) -> tuple[dict[str, Any] | None, str]:
+    """补齐历史规则的输入特征身份（特征编号），并立即重新核对来源。"""
+    rule = store.find("derive_rule", rule_id)
+    if rule is None:
+        return None, f"衍生规则 {rule_id} 不存在或已归档"
+    id_index = feature_id_index()
+    cleaned = [ident for ident in (str(x).strip() for x in identifiers) if ident]
+    unknown = [ident for ident in cleaned if ident not in id_index]
+    if unknown:
+        return rule, f"特征编号 {'、'.join(unknown)} 未在特征注册库登记，无法核对来源"
+    if not cleaned:
+        return rule, "未提供任何输入特征编号"
+
+    rule[IDENTITY_FIELD] = cleaned
+    covered_names = {str(id_index[ident].get("特征名称", "")).strip() for ident in cleaned}
+    rule[PENDING_FIELD] = [
+        token for token in split_tokens(rule.get("输入特征", "")) if token not in covered_names
+    ]
+
+    if rule.get("status") == "草稿" and not rule[PENDING_FIELD]:
+        # 身份补齐且全部输入已注册：立即按可核对来源启效，并把实际输出交给时间窗口
+        rule["status"] = "生效中"
+        rule["pending"] = True
+        rule["abnormal"] = False
+        rule[VERIFY_FIELD] = "已核实"
+        rule_no = str(rule.get("规则编号", ""))
+        _close_identity_followup(rule_no)
+        _window_compute_for_derived(rule, cleaned[0], [])
+        return rule, f"规则 {rule_no} 身份补齐后已按可核对来源启效"
+    rule[VERIFY_FIELD] = "待核实"
+    return rule, "身份已登记，仍有输入等待核实，规则维持草稿"
 
 
 def _window_compute_for_derived(
     derive_row: dict[str, Any], source_feat_no: str, effects: list[FlowEffect]
 ):
-    """为已启效的衍生规则关联的时间窗口触发计算。"""
-    win_rows = store.rows("time_window")
-    output_feat = str(derive_row.get("输出特征", ""))
-    for wrow in win_rows:
+    """规则启效后，把实际输出交给时间窗口：仅启动登记了该输出特征的窗口。
+
+    - 窗口是否接收输出按特征列表精确词条匹配，前缀重叠不算命中；
+    - 已启动窗口的触发依据（awakened_by）不可被后续链路替换，只补登输出与规则编号。
+    """
+    rule_no = str(derive_row.get("规则编号", ""))
+    output_feat = str(derive_row.get("输出特征", "")).strip()
+    registered_windows = list(derive_row.get(WINDOW_FIELD, []))
+
+    for wrow in store.rows("time_window"):
+        window_tokens = set(split_tokens(wrow.get("特征列表", "")))
+        if output_feat not in window_tokens:
+            continue
+        template_no = str(wrow.get("模板编号", ""))
         if wrow.get("status") == "草稿":
             wrow["status"] = "计算中"
             wrow["pending"] = True
             wrow["awakened_by"] = f"feature_reg/{source_feat_no}"
+            wrow["trigger_rule"] = rule_no
+            wrow["登记输出"] = output_feat
             effects.append(FlowEffect(
                 "启动计算", "time_window", int(wrow.get("id", 0)),
-                f"衍生规则 {derive_row.get('规则编号','')} 启效联动窗口 {wrow.get('模板编号','')} 启动计算",
+                f"衍生规则 {rule_no} 启效后输出 {output_feat} 联动窗口 {template_no} 启动计算",
+                ref_no=rule_no,
             ))
+        else:
+            # 窗口已被其它规则启动：保留原触发依据，仅同步匹配关系
+            wrow.setdefault("matched_rules", [])
+            if rule_no not in wrow["matched_rules"]:
+                wrow["matched_rules"].append(rule_no)
+        if template_no not in registered_windows:
+            registered_windows.append(template_no)
+
+    # 匹配结果同步回衍生清单：衍生详情可直接看到输出交给了哪些窗口
+    derive_row[WINDOW_FIELD] = registered_windows
 
 
 # ============================ 链路2: 时间窗口→特征回溯→特征存储/监控 ============================
@@ -671,7 +868,8 @@ class FlowEngine:
             "chains": chain_hits,
             "effects": [
                 {"name": e.name, "module": e.module, "entry_id": e.entry_id,
-                 "description": e.description, "timestamp": e.timestamp}
+                 "description": e.description, "timestamp": e.timestamp,
+                 "ref_no": e.ref_no}
                 for e in all_effects
             ],
             "hits": len(all_effects),

@@ -30,3 +30,9 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class IdentityBackfillPayload(BaseModel):
+    """补齐历史衍生规则输入特征身份（特征编号列表）。"""
+    identifiers: list[str] = Field(default_factory=list)
+    remark: str | None = None

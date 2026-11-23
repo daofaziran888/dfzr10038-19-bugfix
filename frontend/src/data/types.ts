@@ -27,9 +27,26 @@ export type PageResult = {
   size: number
 }
 
+export type FlowEffect = {
+  name: string
+  module: string
+  entry_id: number
+  description: string
+  timestamp: string
+  ref_no?: string | null
+}
+
+export type FlowReceipt = {
+  chains: string[]
+  effects: FlowEffect[]
+  hits: number
+}
+
 export type ActionResult = {
   ok: boolean
   message: string
+  entry?: EntryRow | null
+  flow?: FlowReceipt | null
 }
 
 export type OverviewResult = {
